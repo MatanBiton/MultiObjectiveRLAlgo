@@ -122,9 +122,9 @@ class MOSAC:
         weight = torch.as_tensor(weight, dtype=torch.float32, device=self.device).unsqueeze(0)
         if evaluate:
             mean, _ = self.actor(state, weight)
-            return (torch.tanh(mean) * self.actor.max_action).cpu().numpy()[0]
+            return (torch.tanh(mean) * self.actor.max_action).detach().cpu().numpy()[0]
         action, _ = self.actor.sample(state, weight)
-        return action.cpu().numpy()[0]
+        return action.detach().cpu().numpy()[0]
 
     def train_step(self, buffer, batch_size, gamma=0.99, tau=0.005):
         s, a, rvec, s2, done, w = buffer.sample(batch_size)
