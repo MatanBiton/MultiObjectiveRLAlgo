@@ -32,12 +32,12 @@ class ReplayBuffer:
     def sample(self, batch_size):
         idx = np.random.randint(0, self.size, size=batch_size)
         return (
-            torch.as_tensor(self.state[idx]),
-            torch.as_tensor(self.action[idx]),
-            torch.as_tensor(self.reward[idx]),
-            torch.as_tensor(self.next_state[idx]),
-            torch.as_tensor(self.done[idx]),
-            torch.as_tensor(self.weight[idx]),
+            torch.as_tensor(self.state[idx], dtype=torch.float32),
+            torch.as_tensor(self.action[idx], dtype=torch.float32),
+            torch.as_tensor(self.reward[idx], dtype=torch.float32),
+            torch.as_tensor(self.next_state[idx], dtype=torch.float32),
+            torch.as_tensor(self.done[idx], dtype=torch.float32),
+            torch.as_tensor(self.weight[idx], dtype=torch.float32),
         )
 
 # MLP for actor and critic
@@ -124,8 +124,8 @@ class MOSAC:
         return self.log_alpha.exp()
 
     def select_action(self, state, weight, evaluate=False):
-        state = torch.as_tensor(state, device=self.device).unsqueeze(0)
-        weight = torch.as_tensor(weight, device=self.device).unsqueeze(0)
+        state = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        weight = torch.as_tensor(weight, dtype=torch.float32, device=self.device).unsqueeze(0)
         if evaluate:
             mean, _ = self.actor(state, weight)
             action = torch.tanh(mean) * self.max_action
@@ -134,7 +134,7 @@ class MOSAC:
         return action.cpu().detach().numpy()[0]
 
     def train_step(self, replay_buffer, batch_size, gamma=0.99, tau=0.005):
-        # Sample batch
+        # Sample batch (already float32)
         state, action, reward_vec, next_state, done, weight = replay_buffer.sample(batch_size)
         state, action = state.to(self.device), action.to(self.device)
         next_state, done = next_state.to(self.device), done.to(self.device)
@@ -216,16 +216,3 @@ class MOSAC:
             print(f'Episode {ep}: scalar_return={ep_scalar:.2f}, objectives={ep_rewards}')
 
         writer.close()
-
-if __name__ == '__main__':
-    # Example usage
-    env_name = 'YourMOEnv-v0'
-    env = gym.make(env_name)
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
-    max_action = float(env.action_space.high[0])
-    weight_dim = env.reward_space.shape[0] if hasattr(env, 'reward_space') else state_dim
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    agent = MOSAC(state_dim, action_dim, weight_dim, max_action, device)
-    agent.train(env_name)
