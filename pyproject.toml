@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "testing_mo_algo"
+version = "0.0.1"
+description = "Your project description"
+authors = [{ name = "Matan Biton", email = "matan.biton@campus.technion.ac.il" }]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "gymnasium==1.1.1",
+    "numpy==1.25.2",
+    "torch==2.7.0"
+
+]
