@@ -97,12 +97,20 @@ class Critic(nn.Module):
 # Pareto-Conditioned SAC Agent
 class MOSAC:
     def __init__(self, state_dim, action_dim, weight_dim, max_action, device):
+        # Dimensions and device
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.weight_dim = weight_dim
+        self.max_action = max_action
         self.device = device
+
+        # Networks
         self.actor = Actor(state_dim, action_dim, weight_dim, max_action).to(device)
         self.critic = Critic(state_dim, action_dim, weight_dim).to(device)
         self.critic_target = Critic(state_dim, action_dim, weight_dim).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
+        # Optimizers
         self.actor_opt = optim.Adam(self.actor.parameters(), lr=3e-4)
         self.critic_opt = optim.Adam(self.critic.parameters(), lr=3e-4)
 
@@ -120,12 +128,13 @@ class MOSAC:
         weight = torch.as_tensor(weight, device=self.device).unsqueeze(0)
         if evaluate:
             mean, _ = self.actor(state, weight)
-            action = torch.tanh(mean) * self.actor.max_action
+            action = torch.tanh(mean) * self.max_action
             return action.cpu().detach().numpy()[0]
         action, _ = self.actor.sample(state, weight)
         return action.cpu().detach().numpy()[0]
 
     def train_step(self, replay_buffer, batch_size, gamma=0.99, tau=0.005):
+        # Sample batch
         state, action, reward_vec, next_state, done, weight = replay_buffer.sample(batch_size)
         state, action = state.to(self.device), action.to(self.device)
         next_state, done = next_state.to(self.device), done.to(self.device)
@@ -143,7 +152,6 @@ class MOSAC:
 
         q1, q2 = self.critic(state, action, weight)
         critic_loss = nn.MSELoss()(q1, target_q) + nn.MSELoss()(q2, target_q)
-
         self.critic_opt.zero_grad()
         critic_loss.backward()
         self.critic_opt.step()
@@ -153,7 +161,6 @@ class MOSAC:
         q1_new, q2_new = self.critic(state, action_new, weight)
         q_new = torch.min(q1_new, q2_new)
         actor_loss = (self.alpha * logp_new - q_new).mean()
-
         self.actor_opt.zero_grad()
         actor_loss.backward()
         self.actor_opt.step()
@@ -164,63 +171,61 @@ class MOSAC:
         alpha_loss.backward()
         self.alpha_opt.step()
 
-        # Soft update of target networks
+        # Soft update of targets
         for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
         return critic_loss.item(), actor_loss.item(), alpha_loss.item()
 
-# Training loop with Gymnasium API
-def train(env_name='YourMOEnv-v0', episodes=500, max_steps=1000, batch_size=256):
+    def train(self, env_name='YourMOEnv-v0', episodes=500, max_steps=1000, batch_size=256):
+        # Initialize environment, buffer, and logger
+        env = gym.make(env_name)
+        buffer = ReplayBuffer(self.state_dim, self.action_dim, self.weight_dim)
+        writer = SummaryWriter()
+
+        for ep in range(1, episodes + 1):
+            w = np.random.dirichlet(np.ones(self.weight_dim))
+            state, _ = env.reset()
+            ep_rewards = np.zeros(self.weight_dim)
+            ep_scalar = 0.0
+
+            for step in range(1, max_steps + 1):
+                action = self.select_action(state, w)
+                next_state, reward_vec, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+                reward_vec = np.array(reward_vec, dtype=np.float32)
+
+                buffer.add(state, action, reward_vec, next_state, float(done), w)
+                state = next_state
+                ep_rewards += reward_vec
+                ep_scalar += np.dot(w, reward_vec)
+
+                if buffer.size > batch_size:
+                    c_loss, a_loss, alpha_loss = self.train_step(buffer, batch_size)
+                if done:
+                    break
+
+            # TensorBoard logging
+            for i, r in enumerate(ep_rewards):
+                writer.add_scalar(f'Returns/objective_{i+1}', r, ep)
+            writer.add_scalar('Returns/scalarized', ep_scalar, ep)
+            writer.add_scalar('Loss/critic', c_loss, ep)
+            writer.add_scalar('Loss/actor', a_loss, ep)
+            writer.add_scalar('Loss/alpha', alpha_loss, ep)
+
+            print(f'Episode {ep}: scalar_return={ep_scalar:.2f}, objectives={ep_rewards}')
+
+        writer.close()
+
+if __name__ == '__main__':
+    # Example usage
+    env_name = 'YourMOEnv-v0'
     env = gym.make(env_name)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
-    # You can override weight_dim if your env doesn't have reward_space attribute
-    weight_dim = env.reward_space.shape[0] if hasattr(env, 'reward_space') else None
+    weight_dim = env.reward_space.shape[0] if hasattr(env, 'reward_space') else state_dim
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     agent = MOSAC(state_dim, action_dim, weight_dim, max_action, device)
-    buffer = ReplayBuffer(state_dim, action_dim, weight_dim)
-    writer = SummaryWriter()
-
-    total_steps = 0
-    for ep in range(1, episodes + 1):
-        w = np.random.dirichlet(np.ones(weight_dim))
-        state, _ = env.reset()
-        ep_rewards = np.zeros(weight_dim)
-        ep_scalar = 0.0
-
-        for step in range(1, max_steps + 1):
-            action = agent.select_action(state, w)
-            next_state, reward_vec, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            reward_vec = np.array(reward_vec, dtype=np.float32)
-
-            buffer.add(state, action, reward_vec, next_state, float(done), w)
-
-            state = next_state
-            ep_rewards += reward_vec
-            ep_scalar += np.dot(w, reward_vec)
-            total_steps += 1
-
-            if buffer.size > batch_size:
-                c_loss, a_loss, alpha_loss = agent.train_step(buffer, batch_size)
-
-            if done:
-                break
-
-        # Logging
-        for i, r in enumerate(ep_rewards):
-            writer.add_scalar(f'Returns/objective_{i+1}', r, ep)
-        writer.add_scalar('Returns/scalarized', ep_scalar, ep)
-        writer.add_scalar('Loss/critic', c_loss, ep)
-        writer.add_scalar('Loss/actor', a_loss, ep)
-        writer.add_scalar('Loss/alpha', alpha_loss, ep)
-
-        print(f'Episode {ep}: scalar_return={ep_scalar:.2f}, objectives={ep_rewards}')
-
-    writer.close()
-
-if __name__ == '__main__':
-    train()
+    agent.train(env_name)
