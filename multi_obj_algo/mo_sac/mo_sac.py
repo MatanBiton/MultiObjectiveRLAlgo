@@ -1,4 +1,4 @@
-import mo_gymnasium  # register multi-objective, multi-agent environments
+import mo_gymnasium  # register multi-objective environments
 import numpy as np
 import torch
 import torch.nn as nn
@@ -7,7 +7,7 @@ from torch.distributions import Normal
 from torch.utils.tensorboard import SummaryWriter
 import gymnasium as gym
 
-# Replay buffer for multi-objective transitions, including preference vector
+# Replay buffer for multi-objective transitions
 class ReplayBuffer:
     def __init__(self, state_dim, action_dim, weight_dim, max_size=int(1e6)):
         self.max_size = max_size
@@ -41,48 +41,50 @@ class ReplayBuffer:
             torch.as_tensor(self.weight[idx], dtype=torch.float32),
         )
 
-# MLP for actor and critic
+# Simple MLP
 class MLP(nn.Module):
     def __init__(self, input_dim, output_dim, hidden_dims=(256,256), activation=nn.ReLU):
         super().__init__()
         layers = []
-        dims = (input_dim, *hidden_dims)
+        dims = [input_dim] + list(hidden_dims)
         for i in range(len(hidden_dims)):
             layers.append(nn.Linear(dims[i], dims[i+1]))
             layers.append(activation())
-        layers.append(nn.Linear(dims[-1], output_dim))
+        layers.append(nn.Linear(hidden_dims[-1], output_dim))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.net(x)
 
-# Actor network conditioned on preference vector w
+# Actor with tanh-squashed Gaussian and correct log-prob
 class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, weight_dim, max_action):
+    def __init__(self, state_dim, action_dim, weight_dim, max_action, log_std_bounds=(-20,2)):
         super().__init__()
         self.net = MLP(state_dim + weight_dim, 2 * action_dim)
         self.max_action = max_action
-        self.LOG_STD_MIN = -20
-        self.LOG_STD_MAX = 2
+        self.log_std_min, self.log_std_max = log_std_bounds
 
     def forward(self, state, weight):
         x = torch.cat([state, weight], dim=-1)
         mean_logstd = self.net(x)
         mean, log_std = torch.chunk(mean_logstd, 2, dim=-1)
-        log_std = torch.clamp(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
-        std = log_std.exp()
-        return mean, std
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+        return mean, log_std.exp()
 
     def sample(self, state, weight):
         mean, std = self(state, weight)
         dist = Normal(mean, std)
         z = dist.rsample()
-        action = torch.tanh(z) * self.max_action
-        log_prob = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(-1, keepdim=True)
-        return action, log_prob
+        tanh_z = torch.tanh(z)
+        action = tanh_z * self.max_action
+        # Log-prob with change of variables
+        log_prob_z = dist.log_prob(z).sum(-1, keepdim=True)
+        # log |d action / d z| term: sum log(max_action*(1 - tanh(z)^2))
+        log_det = torch.log(self.max_action * (1 - tanh_z.pow(2)) + 1e-6).sum(-1, keepdim=True)
+        logp = log_prob_z - log_det
+        return action, logp
 
-# Critic Q-network
+# Critic networks
 class Critic(nn.Module):
     def __init__(self, state_dim, action_dim, weight_dim):
         super().__init__()
@@ -91,30 +93,18 @@ class Critic(nn.Module):
 
     def forward(self, state, action, weight):
         x = torch.cat([state, action, weight], dim=-1)
-        q1 = self.q1(x)
-        q2 = self.q2(x)
-        return q1, q2
+        return self.q1(x), self.q2(x)
 
-# Pareto-Conditioned SAC Agent
+# Pareto-Conditioned Soft Actor-Critic
 class MOSAC:
     def __init__(self, state_dim, action_dim, weight_dim, max_action, device):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.weight_dim = weight_dim
-        self.max_action = max_action
         self.device = device
-
-        # Networks
         self.actor = Actor(state_dim, action_dim, weight_dim, max_action).to(device)
         self.critic = Critic(state_dim, action_dim, weight_dim).to(device)
         self.critic_target = Critic(state_dim, action_dim, weight_dim).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
-
-        # Optimizers
         self.actor_opt = optim.Adam(self.actor.parameters(), lr=3e-4)
         self.critic_opt = optim.Adam(self.critic.parameters(), lr=3e-4)
-
-        # Entropy temperature
         self.log_alpha = torch.tensor(0.0, requires_grad=True, device=device)
         self.alpha_opt = optim.Adam([self.log_alpha], lr=3e-4)
         self.target_entropy = -action_dim
@@ -128,84 +118,63 @@ class MOSAC:
         weight = torch.as_tensor(weight, dtype=torch.float32, device=self.device).unsqueeze(0)
         if evaluate:
             mean, _ = self.actor(state, weight)
-            return torch.tanh(mean) * self.max_action
+            return (torch.tanh(mean) * self.actor.max_action).cpu().detach().numpy()[0]
         action, _ = self.actor.sample(state, weight)
-        return action
+        return action.cpu().detach().numpy()[0]
 
-    def train_step(self, replay_buffer, batch_size, gamma=0.99, tau=0.005):
-        state, action, reward_vec, next_state, done, weight = replay_buffer.sample(batch_size)
-        state, action = state.to(self.device), action.to(self.device)
-        next_state, done = next_state.to(self.device), done.to(self.device)
-        reward_vec, weight = reward_vec.to(self.device), weight.to(self.device)
-
-        reward = (reward_vec * weight).sum(-1, keepdim=True)
+    def train_step(self, buffer, batch_size, gamma=0.99, tau=0.005):
+        s, a, rvec, s2, done, w = buffer.sample(batch_size)
+        s,a,s2,done,w = [t.to(self.device) for t in (s,a,s2,done,w)]
+        rvec = rvec.to(self.device)
+        # scalarize
+        r = (rvec * w).sum(-1, keepdim=True)
+        # target
         with torch.no_grad():
-            next_action, next_logp = self.actor.sample(next_state, weight)
-            q1_t, q2_t = self.critic_target(next_state, next_action, weight)
-            q_t = torch.min(q1_t, q2_t) - self.alpha * next_logp
-            target_q = reward + (1 - done) * gamma * q_t
-
-        q1, q2 = self.critic(state, action, weight)
-        critic_loss = nn.MSELoss()(q1, target_q) + nn.MSELoss()(q2, target_q)
+            a2, logp2 = self.actor.sample(s2, w)
+            q1_t, q2_t = self.critic_target(s2, a2, w)
+            q_t = torch.min(q1_t, q2_t) - self.alpha * logp2
+            q_target = r + (1 - done) * gamma * q_t
+        q1, q2 = self.critic(s, a, w)
+        critic_loss = nn.MSELoss()(q1, q_target) + nn.MSELoss()(q2, q_target)
         self.critic_opt.zero_grad(); critic_loss.backward(); self.critic_opt.step()
-
-        action_new, logp_new = self.actor.sample(state, weight)
-        q1_new, q2_new = self.critic(state, action_new, weight)
-        actor_loss = (self.alpha * logp_new - torch.min(q1_new, q2_new)).mean()
+        # actor
+        a_new, logp_new = self.actor.sample(s, w)
+        q1_n, q2_n = self.critic(s, a_new, w)
+        qn = torch.min(q1_n, q2_n)
+        actor_loss = (self.alpha * logp_new - qn).mean()
         self.actor_opt.zero_grad(); actor_loss.backward(); self.actor_opt.step()
-
+        # alpha
         alpha_loss = -(self.log_alpha * (logp_new + self.target_entropy).detach()).mean()
         self.alpha_opt.zero_grad(); alpha_loss.backward(); self.alpha_opt.step()
-
-        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-
+        # soft update
+        for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
+            tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
         return critic_loss.item(), actor_loss.item(), alpha_loss.item()
 
-    def train(self, env_name='MOEnv-v0', env_kwargs=None, episodes=500, max_steps=1000, batch_size=256):
-        """
-        Train the MOSAC agent.
-        env_name   : registered MO env name
-        env_kwargs : dict passed to gym.make
-        episodes   : number of episodes
-        max_steps  : steps per episode
-        batch_size : replay batch size
-        """
+    def train(self, env_name, env_kwargs=None, episodes=500, max_steps=1000, batch_size=256):
         env_kwargs = env_kwargs or {}
         env = gym.make(env_name, disable_env_checker=True, **env_kwargs)
-        buffer = ReplayBuffer(self.state_dim, self.action_dim, self.weight_dim)
+        buffer = ReplayBuffer(env.observation_space.shape[0], env.action_space.shape[0], env.reward_space.shape[0])
         writer = SummaryWriter()
-
         for ep in range(1, episodes+1):
-            c_loss = a_loss = alpha_loss = 0.0
-            w = np.random.dirichlet(np.ones(self.weight_dim))
-            state, _ = env.reset()
-            ep_rewards = np.zeros(self.weight_dim)
-            ep_scalar = 0.0
-
-            for step in range(1, max_steps+1):
-                action = self.select_action(state, w).cpu().detach().numpy()
-                next_state, reward_vec, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                reward_vec = np.array(reward_vec, dtype=np.float32)
-
-                buffer.add(state, action, reward_vec, next_state, float(done), w)
-                state = next_state
-                ep_rewards += reward_vec
-                ep_scalar += np.dot(w, reward_vec)
-
-                if buffer.size > batch_size:
-                    c_loss, a_loss, alpha_loss = self.train_step(buffer, batch_size)
-                if done:
-                    break
-
-            # Logging
-            for i, r in enumerate(ep_rewards):
-                writer.add_scalar(f'Returns/obj_{i+1}', r, ep)
-            writer.add_scalar('Returns/scalar', ep_scalar, ep)
-            writer.add_scalar('Loss/critic', c_loss, ep)
-            writer.add_scalar('Loss/actor', a_loss, ep)
-            writer.add_scalar('Loss/alpha', alpha_loss, ep)
-            print(f'Ep {ep}: scalar={ep_scalar:.2f}, objs={ep_rewards}')
-
+            c_l=a_l=al_l=0.0
+            w = np.random.dirichlet(np.ones(env.reward_space.shape[0]))
+            s,_ = env.reset()
+            epi_r = np.zeros_like(w); epi_rs=0.0
+            for t in range(max_steps):
+                a = self.select_action(s, w)
+                s2, rvec, term, trunc, _ = env.step(a)
+                done = term or trunc
+                rvec = np.array(rvec, dtype=np.float32)
+                buffer.add(s, a, rvec, s2, float(done), w)
+                s = s2; epi_r += rvec; epi_rs += w.dot(rvec)
+                if buffer.size>batch_size:
+                    c_l,a_l,al_l = self.train_step(buffer, batch_size)
+                if done: break
+            for i,val in enumerate(epi_r): writer.add_scalar(f"Return/obj{i+1}", val, ep)
+            writer.add_scalar("Return/scalar", epi_rs, ep)
+            writer.add_scalar("Loss/critic", c_l, ep)
+            writer.add_scalar("Loss/actor", a_l, ep)
+            writer.add_scalar("Loss/alpha", al_l, ep)
+            print(f"Episode {ep}: scalar={epi_rs:.2f}, rewards={epi_r}")
         writer.close()
