@@ -1,3 +1,4 @@
+import mo_gymnasium  # register multi-objective, multi-agent environments
 import numpy as np
 import torch
 import torch.nn as nn
@@ -124,6 +125,7 @@ class MOSAC:
         return self.log_alpha.exp()
 
     def select_action(self, state, weight, evaluate=False):
+        # Ensure float32
         state = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         weight = torch.as_tensor(weight, dtype=torch.float32, device=self.device).unsqueeze(0)
         if evaluate:
@@ -134,7 +136,7 @@ class MOSAC:
         return action.cpu().detach().numpy()[0]
 
     def train_step(self, replay_buffer, batch_size, gamma=0.99, tau=0.005):
-        # Sample batch (already float32)
+        # Sample batch (float32 tensors)
         state, action, reward_vec, next_state, done, weight = replay_buffer.sample(batch_size)
         state, action = state.to(self.device), action.to(self.device)
         next_state, done = next_state.to(self.device), done.to(self.device)
@@ -177,13 +179,22 @@ class MOSAC:
 
         return critic_loss.item(), actor_loss.item(), alpha_loss.item()
 
-    def train(self, env_name='YourMOEnv-v0', episodes=500, max_steps=1000, batch_size=256):
-        # Initialize environment, buffer, and logger
-        env = gym.make(env_name)
+    def train(self, env_name='YourMOEnv-v0', env_kwargs=None, episodes=500, max_steps=1000, batch_size=256):
+        """
+        Train the MOSAC agent.
+        env_name   : Gymnasium environment name (registered via mo_gymnasium).
+        env_kwargs : dict of kwargs passed into gym.make (e.g., multi-agent settings).
+        episodes   : number of episodes to train.
+        max_steps  : max steps per episode.
+        batch_size : replay buffer batch size.
+        """
+        env_kwargs = env_kwargs or {}
+        env = gym.make(env_name, disable_env_checker=True, **env_kwargs)
         buffer = ReplayBuffer(self.state_dim, self.action_dim, self.weight_dim)
         writer = SummaryWriter()
 
         for ep in range(1, episodes + 1):
+            c_loss = a_loss = alpha_loss = 0.0
             w = np.random.dirichlet(np.ones(self.weight_dim))
             state, _ = env.reset()
             ep_rewards = np.zeros(self.weight_dim)
