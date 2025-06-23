@@ -55,17 +55,23 @@ class Actor(nn.Module):
         )
         self.mean = nn.Linear(256, action_dim)
         self.log_std = nn.Linear(256, action_dim)
+        # initialize log_std biases to small negative
+        nn.init.constant_(self.log_std.bias, -2)
 
     def forward(self, state, weight):
         x = torch.cat([state, weight], dim=-1)
         h = self.net(x)
         mean = self.mean(h)
-        log_std = self.log_std(h).clamp(-5, 2)
+        log_std = self.log_std(h).clamp(-5, 0)
         return mean, log_std
 
     def sample(self, state, weight):
         mean, log_std = self.forward(state, weight)
-        std = log_std.exp()
+        std = torch.exp(log_std)
+        # guard against NaNs
+        if torch.isnan(mean).any() or torch.isnan(std).any():
+            mean = torch.nan_to_num(mean)
+            std = torch.clamp(torch.nan_to_num(std), min=1e-3)
         dist = Normal(mean, std)
         z = dist.rsample()
         action = torch.tanh(z) * self.max_action
@@ -91,7 +97,7 @@ class Critic(nn.Module):
         x = torch.cat([state, action, weight], dim=-1)
         return self.q1(x), self.q2(x)
 
-# MOSAC agent with hyper-parameters, replay warm-up, truncation handling, gradient clipping, and state normalization
+# MOSAC agent with hyper-parameters, replay warm-up, truncation handling, and gradient clipping
 class MOSAC:
     def __init__(
         self, state_dim, action_dim, weight_dim, max_action, device,
@@ -105,20 +111,12 @@ class MOSAC:
         self.device = device
 
         # Hyper-parameters
-        self.actor_lr = actor_lr
-        self.critic_lr = critic_lr
-        self.alpha_lr = alpha_lr
         self.gamma = gamma
         self.tau = tau
         self.target_entropy = target_entropy if target_entropy is not None else -0.5 * float(action_dim)
         self.batch_size = batch_size
         self.gradient_steps = gradient_steps
         self.min_buffer_size = int(batch_size * warmup_multiplier)
-
-        # State normalizer
-        self.state_mean = np.zeros(state_dim, dtype=np.float32)
-        self.state_var = np.zeros(state_dim, dtype=np.float32)
-        self.state_count = 1e-4
 
         # Networks
         self.actor = Actor(state_dim, action_dim, weight_dim, max_action).to(device)
@@ -136,19 +134,7 @@ class MOSAC:
     def alpha(self):
         return self.log_alpha.exp()
 
-    def _update_normalizer(self, x):
-        # Welford online update for mean and variance
-        self.state_count += 1
-        delta = x - self.state_mean
-        self.state_mean += delta / self.state_count
-        self.state_var += delta * (x - self.state_mean)
-
-    def _normalize_state(self, x):
-        std = np.sqrt(self.state_var / self.state_count + 1e-8)
-        return (x - self.state_mean) / std
-
     def select_action(self, state, weight, evaluate=False):
-        # state assumed normalized
         state_t = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         weight_t = torch.tensor(weight, dtype=torch.float32, device=self.device).unsqueeze(0)
         if evaluate:
@@ -158,14 +144,11 @@ class MOSAC:
         action, _ = self.actor.sample(state_t, weight_t)
         return action.cpu().detach().numpy()[0]
 
-    def train_step(self, buffer, batch_size):
-        s, a, rvec, s2, done, w = buffer.sample(batch_size)
-        # normalize states
-        s = torch.tensor(self._normalize_state(s.cpu().numpy())) .to(self.device)
-        s2 = torch.tensor(self._normalize_state(s2.cpu().numpy())) .to(self.device)
-        a, done, w, rvec = [t.to(self.device) for t in (a, done, w, rvec)]
+    def train_step(self, buffer):
+        s, a, rvec, s2, done, w = buffer.sample(self.batch_size)
+        s, a, s2, done, w, rvec = [t.to(self.device) for t in (s, a, s2, done, w, rvec)]
 
-        # scalarize
+        # scalarize rewards
         r = (rvec * w).sum(-1, keepdim=True)
         with torch.no_grad():
             a2, logp2 = self.actor.sample(s2, w)
@@ -184,8 +167,7 @@ class MOSAC:
         # actor update
         a_new, logp_new = self.actor.sample(s, w)
         q1_n, q2_n = self.critic(s, a_new, w)
-        qn = torch.min(q1_n, q2_n)
-        actor_loss = (self.alpha * logp_new - qn).mean()
+        actor_loss = (self.alpha * logp_new - torch.min(q1_n, q2_n)).mean()
         self.actor_opt.zero_grad()
         actor_loss.backward()
         nn_utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
@@ -212,19 +194,13 @@ class MOSAC:
         for ep in range(1, episodes + 1):
             c_l = a_l = al_l = 0.0
             w = np.random.dirichlet(np.ones(self.weight_dim))
-            raw_s, _ = env.reset()
-            self._update_normalizer(raw_s)
-            s = self._normalize_state(raw_s)
+            s, _ = env.reset()
             ep_r = np.zeros(self.weight_dim)
             ep_rs = 0.0
 
             for _ in range(max_steps):
                 a = self.select_action(s, w)
-                raw_s2, rvec, term, trunc, _ = env.step(a)
-                self._update_normalizer(raw_s2)
-                s2 = self._normalize_state(raw_s2)
-
-                real_done = bool(term or trunc)
+                s2, rvec, term, trunc, _ = env.step(a)
                 done_flag = float(term)
                 rvec = np.array(rvec, dtype=np.float32)
 
@@ -233,11 +209,12 @@ class MOSAC:
 
                 if buffer.size > self.min_buffer_size:
                     for _ in range(self.gradient_steps):
-                        c_l, a_l, al_l = self.train_step(buffer, self.batch_size)
+                        c_l, a_l, al_l = self.train_step(buffer)
 
-                if real_done:
+                if term or trunc:
                     break
 
+            # logging
             for i, val in enumerate(ep_r): writer.add_scalar(f"Return/obj{i+1}", val, ep)
             writer.add_scalar("Return/scalar", ep_rs, ep)
             writer.add_scalar("Loss/critic", c_l, ep)
