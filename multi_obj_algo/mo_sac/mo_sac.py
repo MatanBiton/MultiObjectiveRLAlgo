@@ -42,6 +42,66 @@ class ReplayBuffer:
             torch.tensor(self.weight[idx], dtype=torch.float32),
         )
 
+# Actor network: outputs gaussian policy conditioned on state and weight
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, weight_dim, max_action):
+        super().__init__()
+        self.max_action = max_action
+        inp_dim = state_dim + weight_dim
+        # feature extractor
+        self.net = nn.Sequential(
+            nn.Linear(inp_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+        )
+        self.mean = nn.Linear(256, action_dim)
+        self.log_std = nn.Linear(256, action_dim)
+
+    def forward(self, state, weight):
+        x = torch.cat([state, weight], dim=-1)
+        h = self.net(x)
+        mean = self.mean(h)
+        log_std = self.log_std(h).clamp(-20, 2)
+        return mean, log_std
+
+    def sample(self, state, weight):
+        mean, log_std = self.forward(state, weight)
+        std = log_std.exp()
+        dist = Normal(mean, std)
+        z = dist.rsample()
+        action = torch.tanh(z) * self.max_action
+        # log prob with Tanh correction
+        log_prob = dist.log_prob(z) - torch.log(self.max_action * (1 - action.pow(2)) + 1e-6)
+        log_prob = log_prob.sum(-1, keepdim=True)
+        return action, log_prob
+
+# Critic network: two Q-functions
+class Critic(nn.Module):
+    def __init__(self, state_dim, action_dim, weight_dim):
+        super().__init__()
+        inp_dim = state_dim + action_dim + weight_dim
+        def build_q():
+            return nn.Sequential(
+                nn.Linear(inp_dim, 256),
+                nn.LayerNorm(256),
+                nn.ReLU(),
+                nn.Linear(256, 256),
+                nn.LayerNorm(256),
+                nn.ReLU(),
+                nn.Linear(256, 1),
+            )
+        self.q1 = build_q()
+        self.q2 = build_q()
+
+    def forward(self, state, action, weight):
+        x = torch.cat([state, action, weight], dim=-1)
+        q1 = self.q1(x)
+        q2 = self.q2(x)
+        return q1, q2
+
 # MOSAC agent with hyper-parameter defaults, replay warm-up, and proper truncation handling
 class MOSAC:
     def __init__(
@@ -77,7 +137,7 @@ class MOSAC:
 
         # Optimizers
         self.actor_opt = optim.Adam(self.actor.parameters(), lr=self.actor_lr)
-        self.critic_opt = optim.Adam(self.critic.parameters(), lr=self.critic_lr)
+        self.critic_opt = optim.Adam(self.critic.parameters(), lr=self.critic_lr, weight_decay=1e-5)
         self.log_alpha = torch.tensor(0.0, requires_grad=True, device=device)
         self.alpha_opt = optim.Adam([self.log_alpha], lr=self.alpha_lr)
 
@@ -114,7 +174,7 @@ class MOSAC:
         critic_loss.backward()
         self.critic_opt.step()
 
-        # actor update
+        # actor update (delayed)
         a_new, logp_new = self.actor.sample(s, w)
         q1_n, q2_n = self.critic(s, a_new, w)
         qn = torch.min(q1_n, q2_n)
@@ -124,22 +184,18 @@ class MOSAC:
         self.actor_opt.step()
 
         # temperature update
-        alpha_loss = -(
-            self.log_alpha * (logp_new + self.target_entropy).detach()
-        ).mean()
+        alpha_loss = -(self.log_alpha * (logp_new + self.target_entropy).detach()).mean()
         self.alpha_opt.zero_grad()
         alpha_loss.backward()
         self.alpha_opt.step()
 
-        # target networks soft update
+        # soft target update
         for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
             tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
 
         return critic_loss.item(), actor_loss.item(), alpha_loss.item()
 
-    def train(
-        self, env_name, env_kwargs=None, episodes=500, max_steps=1000
-    ):
+    def train(self, env_name, env_kwargs=None, episodes=500, max_steps=1000):
         env_kwargs = env_kwargs or {}
         env = gym.make(env_name, disable_env_checker=True, **env_kwargs)
         buffer = ReplayBuffer(self.state_dim, self.action_dim, self.weight_dim)
@@ -155,7 +211,6 @@ class MOSAC:
             for _ in range(max_steps):
                 a = self.select_action(s, w)
                 s2, rvec, term, trunc, _ = env.step(a)
-                # separate true termination from truncation
                 real_done = bool(term or trunc)
                 done_flag = float(term)
                 rvec = np.array(rvec, dtype=np.float32)
@@ -165,7 +220,6 @@ class MOSAC:
                 ep_r += rvec
                 ep_rs += np.dot(w, rvec)
 
-                # only start training after warm-up
                 if buffer.size > self.min_buffer_size:
                     for _ in range(self.gradient_steps):
                         c_l, a_l, al_l = self.train_step(buffer, self.batch_size)
@@ -174,8 +228,7 @@ class MOSAC:
                     break
 
             # logging
-            for i, val in enumerate(ep_r):
-                writer.add_scalar(f"Return/obj{i+1}", val, ep)
+            for i, val in enumerate(ep_r): writer.add_scalar(f"Return/obj{i+1}", val, ep)
             writer.add_scalar("Return/scalar", ep_rs, ep)
             writer.add_scalar("Loss/critic", c_l, ep)
             writer.add_scalar("Loss/actor", a_l, ep)
