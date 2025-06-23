@@ -48,14 +48,9 @@ class Actor(nn.Module):
         super().__init__()
         self.max_action = max_action
         inp_dim = state_dim + weight_dim
-        # feature extractor
         self.net = nn.Sequential(
-            nn.Linear(inp_dim, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
+            nn.Linear(inp_dim, 256), nn.LayerNorm(256), nn.ReLU(),
+            nn.Linear(256, 256), nn.LayerNorm(256), nn.ReLU(),
         )
         self.mean = nn.Linear(256, action_dim)
         self.log_std = nn.Linear(256, action_dim)
@@ -73,7 +68,6 @@ class Actor(nn.Module):
         dist = Normal(mean, std)
         z = dist.rsample()
         action = torch.tanh(z) * self.max_action
-        # log prob with Tanh correction
         log_prob = dist.log_prob(z) - torch.log(self.max_action * (1 - action.pow(2)) + 1e-6)
         log_prob = log_prob.sum(-1, keepdim=True)
         return action, log_prob
@@ -85,12 +79,8 @@ class Critic(nn.Module):
         inp_dim = state_dim + action_dim + weight_dim
         def build_q():
             return nn.Sequential(
-                nn.Linear(inp_dim, 256),
-                nn.LayerNorm(256),
-                nn.ReLU(),
-                nn.Linear(256, 256),
-                nn.LayerNorm(256),
-                nn.ReLU(),
+                nn.Linear(inp_dim, 256), nn.LayerNorm(256), nn.ReLU(),
+                nn.Linear(256, 256), nn.LayerNorm(256), nn.ReLU(),
                 nn.Linear(256, 1),
             )
         self.q1 = build_q()
@@ -102,7 +92,7 @@ class Critic(nn.Module):
         q2 = self.q2(x)
         return q1, q2
 
-# MOSAC agent with hyper-parameter defaults, replay warm-up, and proper truncation handling
+# MOSAC agent with hyper-parameter defaults, replay warm-up, and proper truncation
 class MOSAC:
     def __init__(
         self, state_dim, action_dim, weight_dim, max_action, device,
@@ -115,19 +105,16 @@ class MOSAC:
         self.weight_dim = weight_dim
         self.device = device
 
-        # Hyper-parameters
         self.actor_lr = actor_lr
         self.critic_lr = critic_lr
         self.alpha_lr = alpha_lr
         self.gamma = gamma
         self.tau = tau
-        self.target_entropy = (
-            target_entropy if target_entropy is not None else -0.5 * float(action_dim)
-        )
+        self.target_entropy = target_entropy if target_entropy is not None else -0.5 * float(action_dim)
         self.batch_size = batch_size
         self.gradient_steps = gradient_steps
         self.warmup_multiplier = warmup_multiplier
-        self.min_buffer_size = int(self.batch_size * self.warmup_multiplier)
+        self.min_buffer_size = int(batch_size * warmup_multiplier)
 
         # Networks
         self.actor = Actor(state_dim, action_dim, weight_dim, max_action).to(device)
@@ -136,10 +123,10 @@ class MOSAC:
         self.critic_target.load_state_dict(self.critic.state_dict())
 
         # Optimizers
-        self.actor_opt = optim.Adam(self.actor.parameters(), lr=self.actor_lr)
-        self.critic_opt = optim.Adam(self.critic.parameters(), lr=self.critic_lr, weight_decay=1e-5)
+        self.actor_opt = optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_opt = optim.Adam(self.critic.parameters(), lr=critic_lr, weight_decay=1e-5)
         self.log_alpha = torch.tensor(0.0, requires_grad=True, device=device)
-        self.alpha_opt = optim.Adam([self.log_alpha], lr=self.alpha_lr)
+        self.alpha_opt = optim.Adam([self.log_alpha], lr=alpha_lr)
 
     @property
     def alpha(self):
@@ -150,16 +137,16 @@ class MOSAC:
         weight_t = torch.tensor(weight, dtype=torch.float32, device=self.device).unsqueeze(0)
         if evaluate:
             mean, _ = self.actor(state_t, weight_t)
-            return (torch.tanh(mean) * self.actor.max_action).cpu().numpy()[0]
+            action = torch.tanh(mean) * self.actor.max_action
+            return action.cpu().detach().numpy()[0]
         action, _ = self.actor.sample(state_t, weight_t)
-        return action.cpu().numpy()[0]
+        return action.cpu().detach().numpy()[0]
 
     def train_step(self, buffer, batch_size):
         s, a, rvec, s2, done, w = buffer.sample(batch_size)
         s, a, s2, done, w = [t.to(self.device) for t in (s, a, s2, done, w)]
         rvec = rvec.to(self.device)
 
-        # scalarize
         r = (rvec * w).sum(-1, keepdim=True)
         with torch.no_grad():
             a2, logp2 = self.actor.sample(s2, w)
@@ -167,29 +154,22 @@ class MOSAC:
             q_t = torch.min(q1_t, q2_t) - self.alpha * logp2
             q_target = r + (1 - done) * self.gamma * q_t
 
-        # critic update
         q1, q2 = self.critic(s, a, w)
         critic_loss = nn.MSELoss()(q1, q_target) + nn.MSELoss()(q2, q_target)
-        self.critic_opt.zero_grad()
-        critic_loss.backward()
-        self.critic_opt.step()
+        self.critic_opt.zero_grad(); critic_loss.backward(); self.critic_opt.step()
 
-        # actor update (delayed)
+        # actor
         a_new, logp_new = self.actor.sample(s, w)
         q1_n, q2_n = self.critic(s, a_new, w)
         qn = torch.min(q1_n, q2_n)
         actor_loss = (self.alpha * logp_new - qn).mean()
-        self.actor_opt.zero_grad()
-        actor_loss.backward()
-        self.actor_opt.step()
+        self.actor_opt.zero_grad(); actor_loss.backward(); self.actor_opt.step()
 
-        # temperature update
+        # alpha
         alpha_loss = -(self.log_alpha * (logp_new + self.target_entropy).detach()).mean()
-        self.alpha_opt.zero_grad()
-        alpha_loss.backward()
-        self.alpha_opt.step()
+        self.alpha_opt.zero_grad(); alpha_loss.backward(); self.alpha_opt.step()
 
-        # soft target update
+        # update
         for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
             tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
 
@@ -216,9 +196,7 @@ class MOSAC:
                 rvec = np.array(rvec, dtype=np.float32)
 
                 buffer.add(s, a, rvec, s2, done_flag, w)
-                s = s2
-                ep_r += rvec
-                ep_rs += np.dot(w, rvec)
+                s = s2; ep_r += rvec; ep_rs += np.dot(w, rvec)
 
                 if buffer.size > self.min_buffer_size:
                     for _ in range(self.gradient_steps):
@@ -227,7 +205,6 @@ class MOSAC:
                 if real_done:
                     break
 
-            # logging
             for i, val in enumerate(ep_r): writer.add_scalar(f"Return/obj{i+1}", val, ep)
             writer.add_scalar("Return/scalar", ep_rs, ep)
             writer.add_scalar("Loss/critic", c_l, ep)
