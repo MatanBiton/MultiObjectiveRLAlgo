@@ -69,7 +69,6 @@ class Actor(nn.Module):
         dist = Normal(mean, std)
         z = dist.rsample()
         action = torch.tanh(z) * self.max_action
-        # log prob with Tanh correction
         log_prob = dist.log_prob(z) - torch.log(self.max_action * (1 - action.pow(2)) + 1e-6)
         log_prob = log_prob.sum(-1, keepdim=True)
         return action, log_prob
@@ -92,7 +91,7 @@ class Critic(nn.Module):
         x = torch.cat([state, action, weight], dim=-1)
         return self.q1(x), self.q2(x)
 
-# MOSAC agent with hyper-parameters, replay warm-up, truncation handling, and gradient clipping
+# MOSAC agent with hyper-parameters, replay warm-up, truncation handling, gradient clipping, and state normalization
 class MOSAC:
     def __init__(
         self, state_dim, action_dim, weight_dim, max_action, device,
@@ -116,6 +115,11 @@ class MOSAC:
         self.gradient_steps = gradient_steps
         self.min_buffer_size = int(batch_size * warmup_multiplier)
 
+        # State normalizer
+        self.state_mean = np.zeros(state_dim, dtype=np.float32)
+        self.state_var = np.zeros(state_dim, dtype=np.float32)
+        self.state_count = 1e-4
+
         # Networks
         self.actor = Actor(state_dim, action_dim, weight_dim, max_action).to(device)
         self.critic = Critic(state_dim, action_dim, weight_dim).to(device)
@@ -132,7 +136,19 @@ class MOSAC:
     def alpha(self):
         return self.log_alpha.exp()
 
+    def _update_normalizer(self, x):
+        # Welford online update for mean and variance
+        self.state_count += 1
+        delta = x - self.state_mean
+        self.state_mean += delta / self.state_count
+        self.state_var += delta * (x - self.state_mean)
+
+    def _normalize_state(self, x):
+        std = np.sqrt(self.state_var / self.state_count + 1e-8)
+        return (x - self.state_mean) / std
+
     def select_action(self, state, weight, evaluate=False):
+        # state assumed normalized
         state_t = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         weight_t = torch.tensor(weight, dtype=torch.float32, device=self.device).unsqueeze(0)
         if evaluate:
@@ -144,8 +160,10 @@ class MOSAC:
 
     def train_step(self, buffer, batch_size):
         s, a, rvec, s2, done, w = buffer.sample(batch_size)
-        s, a, s2, done, w = [t.to(self.device) for t in (s, a, s2, done, w)]
-        rvec = rvec.to(self.device)
+        # normalize states
+        s = torch.tensor(self._normalize_state(s.cpu().numpy())) .to(self.device)
+        s2 = torch.tensor(self._normalize_state(s2.cpu().numpy())) .to(self.device)
+        a, done, w, rvec = [t.to(self.device) for t in (a, done, w, rvec)]
 
         # scalarize
         r = (rvec * w).sum(-1, keepdim=True)
@@ -194,13 +212,18 @@ class MOSAC:
         for ep in range(1, episodes + 1):
             c_l = a_l = al_l = 0.0
             w = np.random.dirichlet(np.ones(self.weight_dim))
-            s, _ = env.reset()
+            raw_s, _ = env.reset()
+            self._update_normalizer(raw_s)
+            s = self._normalize_state(raw_s)
             ep_r = np.zeros(self.weight_dim)
             ep_rs = 0.0
 
             for _ in range(max_steps):
                 a = self.select_action(s, w)
-                s2, rvec, term, trunc, _ = env.step(a)
+                raw_s2, rvec, term, trunc, _ = env.step(a)
+                self._update_normalizer(raw_s2)
+                s2 = self._normalize_state(raw_s2)
+
                 real_done = bool(term or trunc)
                 done_flag = float(term)
                 rvec = np.array(rvec, dtype=np.float32)
