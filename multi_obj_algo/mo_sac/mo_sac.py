@@ -54,15 +54,18 @@ class BaseNet(nn.Module):
         self.layers_info = []
         
         dims = [input_dim] + list(hidden_dims)
+        # Define hidden layers
         for i in range(len(hidden_dims)):
             self.layers_info.append(('linear', dims[i], dims[i+1]))
+        # Define the final output layer
         self.layers_info.append(('linear', hidden_dims[-1], output_dim))
 
     def forward(self, x, weights):
         idx = 0
-        for layer_type, in_dim, out_dim in self.layers_info:
+        # --- CORRECTED LOGIC ---
+        # Iterate over hidden layers (all but the last)
+        for layer_type, in_dim, out_dim in self.layers_info[:-1]:
             if layer_type == 'linear':
-                # Extract weights and biases for the current layer
                 w_size = in_dim * out_dim
                 b_size = out_dim
                 w = weights[:, idx : idx + w_size].reshape(-1, out_dim, in_dim)
@@ -70,11 +73,22 @@ class BaseNet(nn.Module):
                 b = weights[:, idx : idx + b_size].reshape(-1, out_dim)
                 idx += b_size
                 
-                # Apply linear layer and activation
+                # Apply linear layer and ReLU activation
                 x = F.relu(torch.bmm(x.unsqueeze(1), w.transpose(1, 2)).squeeze(1) + b)
         
-        # Final layer without activation
-        x = torch.bmm(x.unsqueeze(1), w.transpose(1, 2)).squeeze(1) + b
+        # Handle the final output layer separately (no activation)
+        layer_type, in_dim, out_dim = self.layers_info[-1]
+        if layer_type == 'linear':
+            w_size = in_dim * out_dim
+            b_size = out_dim
+            w = weights[:, idx : idx + w_size].reshape(-1, out_dim, in_dim)
+            idx += w_size
+            b = weights[:, idx : idx + b_size].reshape(-1, out_dim)
+            idx += b_size
+            
+            # Final linear transformation without activation
+            x = torch.bmm(x.unsqueeze(1), w.transpose(1, 2)).squeeze(1) + b
+
         return x
 
 # HyperNetwork that generates parameters for the BaseNet
