@@ -106,7 +106,10 @@ class MOSAC:
         sampled_action = self.select_action(obs)
         actor_input = torch.cat([obs, torch.FloatTensor(sampled_action)], dim=-1)
         q_values = torch.stack([critic(actor_input) for critic in self.critics], dim=1).mean(dim=1)
-        actor_loss = -(q_values.mean() - self.alpha * torch.distributions.Normal(*self.actor(obs).chunk(2, dim=-1)).entropy().mean())
+        mean, log_std = self.actor(obs).chunk(2, dim=-1)
+        std = log_std.exp()  # Ensuring positivity
+        dist = torch.distributions.Normal(mean, std)
+        actor_loss = -(q_values.mean() - self.alpha * dist.entropy().mean())
         actor_loss.backward()
         self.actor_opt.step()
 
