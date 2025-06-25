@@ -84,8 +84,9 @@ class MOSAC:
         dones = torch.FloatTensor(dones)
 
         with torch.no_grad():
-            next_action = self.select_action(next_obs)
+            next_action = torch.FloatTensor(self.select_action(next_obs))
             next_input = torch.cat([next_obs, next_action], dim=-1)
+
 
             target_q = []
             for idx, tc in enumerate(self.target_critics):
