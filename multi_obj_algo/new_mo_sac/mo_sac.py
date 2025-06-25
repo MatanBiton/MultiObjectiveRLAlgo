@@ -64,8 +64,9 @@ class MOSAC:
         self.writer = SummaryWriter(writer_filename)
 
     def select_action(self, obs, deterministic=False):
-        mean_logstd = self.actor(torch.FloatTensor(obs))
-        mean, log_std = mean_logstd.chunk(2, dim=-1)
+        obs_tensor = torch.FloatTensor(obs)
+        mean, log_std = self.actor(obs_tensor).chunk(2, dim=-1)
+        log_std = torch.clamp(log_std, min=-20, max=2)
         std = log_std.exp()
 
         if deterministic:
@@ -73,7 +74,9 @@ class MOSAC:
 
         normal = torch.distributions.Normal(mean, std)
         action = normal.rsample()
-        return torch.tanh(action).detach().numpy()
+        action = torch.tanh(action)
+
+        return action.detach().numpy()
 
     def update(self, step):
         obs, actions, rewards, next_obs, dones = self.buffer.sample(self.batch_size)
@@ -107,11 +110,16 @@ class MOSAC:
         actor_input = torch.cat([obs, torch.FloatTensor(sampled_action)], dim=-1)
         q_values = torch.stack([critic(actor_input) for critic in self.critics], dim=1).mean(dim=1)
         mean, log_std = self.actor(obs).chunk(2, dim=-1)
-        std = log_std.exp()  # Ensuring positivity
+        log_std = torch.clamp(log_std, min=-20, max=2)
+        std = log_std.exp()
         dist = torch.distributions.Normal(mean, std)
         actor_loss = -(q_values.mean() - self.alpha * dist.entropy().mean())
+
+        self.actor_opt.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=5)
         self.actor_opt.step()
+
 
         for tc, c in zip(self.target_critics, self.critics):
             for tp, p in zip(tc.parameters(), c.parameters()):
