@@ -117,7 +117,7 @@ class MOSAC:
 
         # Critic update
         critic_losses = []
-        for (critic, critic_opt, target) in zip(self.critics, self.critics_opt, target_q):
+        for critic, critic_opt, target in zip(self.critics, self.critics_opt, target_q):
             critic_opt.zero_grad()
             q_value = critic(torch.cat([obs, actions], dim=-1))
             loss = F.mse_loss(q_value, target)
@@ -154,37 +154,35 @@ class MOSAC:
             self.writer.add_scalar(f'Loss/Critic_{i}', loss, step)
 
     def _log_info(self, info, ep_idx):
-        # Hardcoded ISO fields
+        # Unrolled logging for ISO fields
         iso = info['iso']
+        # Each field unconditionally logged
         self.writer.add_scalar('Info/iso/predicted_demands', np.mean(iso['predicted_demands']), ep_idx)
         self.writer.add_scalar('Info/iso/realized_demands', np.mean(iso['realized_demands']), ep_idx)
+        self.writer.add_scalar('Info/iso/pcs_demands', np.mean(iso['pcs_demands']), ep_idx)
+        self.writer.add_scalar('Info/iso/net_demands', np.mean(iso['net_demands']), ep_idx)
+        self.writer.add_scalar('Info/iso/shortfalls', np.mean(iso['shortfalls']), ep_idx)
         self.writer.add_scalar('Info/iso/dispatch_costs', np.mean(iso['dispatch_costs']), ep_idx)
-        self.writer.add_scalar('Info/iso/shortfall', iso['shortfall'], ep_idx)
-        self.writer.add_scalar('Info/iso/reserve_cost', iso['reserve_cost'], ep_idx)
-        self.writer.add_scalar('Info/iso/dispatch_cost', iso['dispatch_cost'], ep_idx)
-        # Dynamic ISO actions mean
-        acts = np.array(iso['actions'])
-        for comp in range(self.act_dim):
-            self.writer.add_scalar(
-                f'Info/iso/actions_mean_comp{comp}',
-                acts[:, comp].mean(),
-                ep_idx
-            )
+        self.writer.add_scalar('Info/iso/reserve_costs', np.mean(iso['reserve_costs']), ep_idx)
+        self.writer.add_scalar('Info/iso/total_costs', np.mean(iso['total_costs']), ep_idx)
+        self.writer.add_scalar('Info/iso/buy_prices', np.mean(iso['buy_prices']), ep_idx)
+        self.writer.add_scalar('Info/iso/sell_prices', np.mean(iso['sell_prices']), ep_idx)
+        self.writer.add_scalar('Info/iso/energy_bought', np.mean(iso['energy_bought']), ep_idx)
+        self.writer.add_scalar('Info/iso/energy_sold', np.mean(iso['energy_sold']), ep_idx)
+        self.writer.add_scalar('Info/iso/revenues', np.mean(iso['revenues']), ep_idx)
+        self.writer.add_scalar('Info/iso/rewards', np.mean(iso['rewards']), ep_idx)
+        total_iso_reward = iso['total_reward']
+        self.writer.add_scalar('Info/iso/total_reward', np.mean(total_iso_reward) if isinstance(total_iso_reward, (list, np.ndarray)) else total_iso_reward, ep_idx)
 
-        # Hardcoded PCS fields
+        # Unrolled logging for PCS fields
         pcs = info['pcs']
         self.writer.add_scalar('Info/pcs/battery_levels', np.mean(pcs['battery_levels']), ep_idx)
         self.writer.add_scalar('Info/pcs/energy_exchanges', np.mean(pcs['energy_exchanges']), ep_idx)
         self.writer.add_scalar('Info/pcs/costs', np.mean(pcs['costs']), ep_idx)
-        self.writer.add_scalar('Info/pcs/shortfall', pcs['shortfall'], ep_idx)
-        # Dynamic PCS actions mean
-        pcs_acts = np.array(pcs['actions'])
-        for comp in range(self.act_dim):
-            self.writer.add_scalar(
-                f'Info/pcs/actions_mean_comp{comp}',
-                pcs_acts[:, comp].mean(),
-                ep_idx
-            )
+        self.writer.add_scalar('Info/pcs/rewards', np.mean(pcs['rewards']), ep_idx)
+        self.writer.add_scalar('Info/pcs/battery_utilization', np.mean(pcs['battery_utilization']), ep_idx)
+        # total_reward possibly scalar
+        self.writer.add_scalar('Info/pcs/total_reward', pcs['total_reward'], ep_idx)
 
     def train(self, num_episodes):
         step = 0
@@ -199,23 +197,22 @@ class MOSAC:
                 self.buffer.add((obs, action, reward, next_obs, terminated or truncated))
                 episode_rewards += reward
 
-                                # Per-step raw action logging
-                if self.verbose:
-                    # Log current step action from info fields
-                    iso_act = np.array(info['iso_action'])
-                    for comp in range(iso_act.shape[0]):
-                        self.writer.add_scalar(
-                            f'Raw/iso/action_comp{comp}',
-                            float(iso_act[comp]),
-                            self.global_step
-                        )
-                    pcs_act = np.array(info['pcs_action'])
-                    for comp in range(pcs_act.shape[0]):
-                        self.writer.add_scalar(
-                            f'Raw/pcs/action_comp{comp}',
-                            float(pcs_act[comp]),
-                            self.global_step
-                        )
+                # Raw per-step action logging
+                if self.verbose and 'iso' in info and 'pcs' in info:
+                    iso_actions = info['iso'].get('actions', [])
+                    if len(iso_actions) > self.global_step:
+                        act = iso_actions[self.global_step]
+                        for comp, val in enumerate(act):
+                            self.writer.add_scalar(
+                                f'Raw/iso/action_comp{comp}', val, self.global_step
+                            )
+                    pcs_actions = info['pcs'].get('actions', [])
+                    if len(pcs_actions) > self.global_step:
+                        act_pcs = pcs_actions[self.global_step]
+                        for comp, val in enumerate(act_pcs):
+                            self.writer.add_scalar(
+                                f'Raw/pcs/action_comp{comp}', val, self.global_step
+                            )
                     self.global_step += 1
 
                 obs = next_obs
@@ -227,7 +224,7 @@ class MOSAC:
                 if terminated or truncated:
                     break
 
-            # Episode-level logging
+            # Episode-level rewards
             for idx, r in enumerate(episode_rewards):
                 self.writer.add_scalar(f'Reward/Objective_{idx}', r, ep)
             if self.verbose and last_info is not None:
