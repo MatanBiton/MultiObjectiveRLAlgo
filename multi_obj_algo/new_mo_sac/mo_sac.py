@@ -190,31 +190,33 @@ class MOSAC:
             obs, _ = self.env.reset()
             episode_rewards = np.zeros(self.objectives)
             last_info = None
-            for _ in range(self.max_steps):
+            for t in range(self.max_steps):
                 action = self.select_action(obs)
                 next_obs, reward, terminated, truncated, info = self.env.step(action)
                 last_info = info
                 self.buffer.add((obs, action, reward, next_obs, terminated or truncated))
                 episode_rewards += reward
 
-                # Raw per-step action logging
-                if self.verbose and 'iso' in info and 'pcs' in info:
-                    iso_actions = info['iso'].get('actions', [])
-                    if len(iso_actions) > self.global_step:
-                        act = iso_actions[self.global_step]
-                        for comp, val in enumerate(act):
+                                # Raw per-step action logging
+                if self.verbose:
+                    # Log ISO action directly from the action variable
+                    for comp, val in enumerate(action):
+                        self.writer.add_scalar(
+                            f'Raw/iso/action_comp{comp}',
+                            val,
+                            self.global_step
+                        )
+                    # Log PCS action from info dict if available
+                    pcs_actions = info.get('pcs', {}).get('actions', [])
+                    if len(pcs_actions) > t:
+                        pcs_act = pcs_actions[t]
+                        for comp, val in enumerate(pcs_act):
                             self.writer.add_scalar(
-                                f'Raw/iso/action_comp{comp}', val, self.global_step
-                            )
-                    pcs_actions = info['pcs'].get('actions', [])
-                    if len(pcs_actions) > self.global_step:
-                        act_pcs = pcs_actions[self.global_step]
-                        for comp, val in enumerate(act_pcs):
-                            self.writer.add_scalar(
-                                f'Raw/pcs/action_comp{comp}', val, self.global_step
+                                f'Raw/pcs/action_comp{comp}',
+                                val,
+                                self.global_step
                             )
                     self.global_step += 1
-                    self.writer.add_scalar(f"global_step", self.global_step, self.global_step)
 
                 obs = next_obs
 
