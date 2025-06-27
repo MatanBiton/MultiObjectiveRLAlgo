@@ -203,14 +203,14 @@ class MOSAC:
                 if self.verbose:
                     # Log current step action from info fields
                     iso_act = np.array(info['iso_action'])
-                    for comp in range(self.act_dim):
+                    for comp in range(iso_act.shape[0]):
                         self.writer.add_scalar(
                             f'Raw/iso/action_comp{comp}',
                             float(iso_act[comp]),
                             self.global_step
                         )
                     pcs_act = np.array(info['pcs_action'])
-                    for comp in range(self.act_dim):
+                    for comp in range(pcs_act.shape[0]):
                         self.writer.add_scalar(
                             f'Raw/pcs/action_comp{comp}',
                             float(pcs_act[comp]),
