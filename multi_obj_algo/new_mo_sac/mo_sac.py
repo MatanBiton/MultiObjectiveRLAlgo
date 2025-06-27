@@ -39,7 +39,7 @@ class ReplayBuffer:
 class MOSAC:
     def __init__(self, env, objectives, hidden_sizes=[256, 256], actor_lr=3e-4, critic_lr=3e-4,
                  alpha=0.2, gamma=0.99, tau=0.005, batch_size=256, buffer_capacity=100000,
-                 max_steps_per_episode=500, writer_filename='mosac_runs'):
+                 max_steps_per_episode=500, writer_filename='mosac_runs', verbose=False):
         self.env = env
         self.objectives = objectives
         self.obs_dim = env.observation_space.shape[0]
@@ -49,6 +49,7 @@ class MOSAC:
         self.alpha = alpha
         self.batch_size = batch_size
         self.max_steps = max_steps_per_episode
+        self.verbose = verbose
 
         self.actor = MLP(self.obs_dim, self.act_dim * 2, hidden_sizes)
         self.critics = [MLP(self.obs_dim + self.act_dim, 1, hidden_sizes) for _ in range(objectives)]
@@ -62,6 +63,22 @@ class MOSAC:
 
         self.buffer = ReplayBuffer(buffer_capacity)
         self.writer = SummaryWriter(writer_filename)
+
+    def _log_info(self, info, ep_idx):
+        # Log iso sub-dict
+        for key, val in info.get('iso', {}).items():
+            tag = f'Info/iso/{key}'
+            if isinstance(val, (list, np.ndarray)):
+                self.writer.add_scalar(tag, np.mean(val), ep_idx)
+            else:
+                self.writer.add_scalar(tag, val, ep_idx)
+        # Log pcs sub-dict
+        for key, val in info.get('pcs', {}).items():
+            tag = f'Info/pcs/{key}'
+            if isinstance(val, (list, np.ndarray)):
+                self.writer.add_scalar(tag, np.mean(val), ep_idx)
+            else:
+                self.writer.add_scalar(tag, val, ep_idx)
 
     def select_action(self, obs, deterministic=False):
         obs_tensor = torch.FloatTensor(obs)
@@ -134,12 +151,14 @@ class MOSAC:
         for ep in range(num_episodes):
             obs, _ = self.env.reset()
             episode_rewards = np.zeros(self.objectives)
+            last_info = None
             for _ in range(self.max_steps):
                 action = self.select_action(obs)
-                next_obs, reward, terminated, truncated, _ = self.env.step(action)
+                next_obs, reward, terminated, truncated, info = self.env.step(action)
                 self.buffer.add((obs, action, reward, next_obs, terminated or truncated))
                 episode_rewards += reward
                 obs = next_obs
+                last_info = info
 
                 if len(self.buffer.buffer) > self.batch_size:
                     self.update(step)
@@ -150,6 +169,11 @@ class MOSAC:
 
             for idx, r in enumerate(episode_rewards):
                 self.writer.add_scalar(f'Reward/Objective_{idx}', r, ep)
+            
+            # Optional verbose info logging
+            if self.verbose and last_info is not None:
+                self._log_info(last_info, ep)
+
 
     def evaluate(self, episodes=10):
         rewards = []
