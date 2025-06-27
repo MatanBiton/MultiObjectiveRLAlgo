@@ -199,20 +199,21 @@ class MOSAC:
                 self.buffer.add((obs, action, reward, next_obs, terminated or truncated))
                 episode_rewards += reward
 
-                # Per-step raw action logging
+                                # Per-step raw action logging
                 if self.verbose:
-                    iso_act = np.array(info['iso']['actions'])
+                    # Log current step action from info fields
+                    iso_act = np.array(info['iso_action'])
                     for comp in range(self.act_dim):
                         self.writer.add_scalar(
                             f'Raw/iso/action_comp{comp}',
-                            iso_act[comp],
+                            float(iso_act[comp]),
                             self.global_step
                         )
-                    pcs_act = np.array(info['pcs']['actions'])
+                    pcs_act = np.array(info['pcs_action'])
                     for comp in range(self.act_dim):
                         self.writer.add_scalar(
                             f'Raw/pcs/action_comp{comp}',
-                            pcs_act[comp],
+                            float(pcs_act[comp]),
                             self.global_step
                         )
                     self.global_step += 1
