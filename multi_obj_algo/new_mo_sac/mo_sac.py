@@ -14,8 +14,8 @@ class MLP(nn.Module):
         super().__init__()
         layers = []
         dims = [input_dim] + hidden_sizes
-        for i in range(len(dims)-1):
-            layers.append(nn.Linear(dims[i], dims[i+1]))
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
             layers.append(activation())
         layers.append(nn.Linear(dims[-1], output_dim))
         self.model = nn.Sequential(*layers)
@@ -37,9 +37,22 @@ class ReplayBuffer:
 
 
 class MOSAC:
-    def __init__(self, env, objectives, hidden_sizes=[256, 256], actor_lr=3e-4, critic_lr=3e-4,
-                 alpha=0.2, gamma=0.99, tau=0.005, batch_size=256, buffer_capacity=100000,
-                 max_steps_per_episode=500, writer_filename='mosac_runs', verbose=False):
+    def __init__(
+        self,
+        env,
+        objectives,
+        hidden_sizes=[256, 256],
+        actor_lr=3e-4,
+        critic_lr=3e-4,
+        alpha=0.2,
+        gamma=0.99,
+        tau=0.005,
+        batch_size=256,
+        buffer_capacity=100000,
+        max_steps_per_episode=500,
+        writer_filename='mosac_runs',
+        verbose=False
+    ):
         self.env = env
         self.objectives = objectives
         self.obs_dim = env.observation_space.shape[0]
@@ -50,35 +63,24 @@ class MOSAC:
         self.batch_size = batch_size
         self.max_steps = max_steps_per_episode
         self.verbose = verbose
+        self.global_step = 0
 
+        # Networks
         self.actor = MLP(self.obs_dim, self.act_dim * 2, hidden_sizes)
         self.critics = [MLP(self.obs_dim + self.act_dim, 1, hidden_sizes) for _ in range(objectives)]
         self.target_critics = [MLP(self.obs_dim + self.act_dim, 1, hidden_sizes) for _ in range(objectives)]
 
+        # Optimizers
         self.actor_opt = optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critics_opt = [optim.Adam(c.parameters(), lr=critic_lr) for c in self.critics]
 
+        # Copy target network weights
         for tc, c in zip(self.target_critics, self.critics):
             tc.load_state_dict(c.state_dict())
 
+        # Replay buffer and TensorBoard writer
         self.buffer = ReplayBuffer(buffer_capacity)
         self.writer = SummaryWriter(writer_filename)
-
-    def _log_info(self, info, ep_idx):
-        # Log iso sub-dict
-        for key, val in info.get('iso', {}).items():
-            tag = f'Info/iso/{key}'
-            if isinstance(val, (list, np.ndarray)):
-                self.writer.add_scalar(tag, np.mean(val), ep_idx)
-            else:
-                self.writer.add_scalar(tag, val, ep_idx)
-        # Log pcs sub-dict
-        for key, val in info.get('pcs', {}).items():
-            tag = f'Info/pcs/{key}'
-            if isinstance(val, (list, np.ndarray)):
-                self.writer.add_scalar(tag, np.mean(val), ep_idx)
-            else:
-                self.writer.add_scalar(tag, val, ep_idx)
 
     def select_action(self, obs, deterministic=False):
         obs_tensor = torch.FloatTensor(obs)
@@ -89,11 +91,9 @@ class MOSAC:
         if deterministic:
             return mean.detach().numpy()
 
-        normal = torch.distributions.Normal(mean, std)
-        action = normal.rsample()
-        action = torch.tanh(action)
-
-        return action.detach().numpy()
+        dist = torch.distributions.Normal(mean, std)
+        action = dist.rsample()
+        return torch.tanh(action).detach().numpy()
 
     def update(self, step):
         obs, actions, rewards, next_obs, dones = self.buffer.sample(self.batch_size)
@@ -103,48 +103,88 @@ class MOSAC:
         next_obs = torch.FloatTensor(next_obs)
         dones = torch.FloatTensor(dones)
 
+        # Compute target Q-values
         with torch.no_grad():
             next_action = torch.FloatTensor(self.select_action(next_obs))
             next_input = torch.cat([next_obs, next_action], dim=-1)
-
-
             target_q = []
             for idx, tc in enumerate(self.target_critics):
                 q_next = tc(next_input)
-                target_q.append(rewards[:, idx].unsqueeze(-1) + self.gamma * (1 - dones.unsqueeze(-1)) * q_next)
+                target_q.append(
+                    rewards[:, idx].unsqueeze(-1)
+                    + self.gamma * (1 - dones.unsqueeze(-1)) * q_next
+                )
 
+        # Critic update
         critic_losses = []
-        for idx, (critic, critic_opt, target) in enumerate(zip(self.critics, self.critics_opt, target_q)):
+        for (critic, critic_opt, target) in zip(self.critics, self.critics_opt, target_q):
             critic_opt.zero_grad()
             q_value = critic(torch.cat([obs, actions], dim=-1))
-            critic_loss = F.mse_loss(q_value, target)
-            critic_loss.backward()
+            loss = F.mse_loss(q_value, target)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=5)
             critic_opt.step()
-            critic_losses.append(critic_loss.item())
+            critic_losses.append(loss.item())
 
+        # Actor update
         self.actor_opt.zero_grad()
-        sampled_action = self.select_action(obs)
-        actor_input = torch.cat([obs, torch.FloatTensor(sampled_action)], dim=-1)
-        q_values = torch.stack([critic(actor_input) for critic in self.critics], dim=1).mean(dim=1)
         mean, log_std = self.actor(obs).chunk(2, dim=-1)
         log_std = torch.clamp(log_std, min=-20, max=2)
         std = log_std.exp()
         dist = torch.distributions.Normal(mean, std)
-        actor_loss = -(q_values.mean() - self.alpha * dist.entropy().mean())
 
-        self.actor_opt.zero_grad()
+        sampled_action = torch.tanh(dist.rsample())
+        actor_input = torch.cat([obs, sampled_action], dim=-1)
+        q_vals = torch.stack([c(actor_input) for c in self.critics], dim=1).mean(dim=1)
+        actor_loss = -(
+            q_vals.mean() - self.alpha * dist.entropy().mean()
+        )
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=5)
         self.actor_opt.step()
 
-
+        # Soft update of target networks
         for tc, c in zip(self.target_critics, self.critics):
             for tp, p in zip(tc.parameters(), c.parameters()):
                 tp.data.copy_(tp.data * (1.0 - self.tau) + p.data * self.tau)
 
+        # Log losses
         self.writer.add_scalar('Loss/Actor', actor_loss.item(), step)
         for i, loss in enumerate(critic_losses):
             self.writer.add_scalar(f'Loss/Critic_{i}', loss, step)
+
+    def _log_info(self, info, ep_idx):
+        # Hardcoded ISO fields
+        iso = info['iso']
+        self.writer.add_scalar('Info/iso/predicted_demands', np.mean(iso['predicted_demands']), ep_idx)
+        self.writer.add_scalar('Info/iso/realized_demands', np.mean(iso['realized_demands']), ep_idx)
+        self.writer.add_scalar('Info/iso/dispatch_costs', np.mean(iso['dispatch_costs']), ep_idx)
+        self.writer.add_scalar('Info/iso/shortfall', iso['shortfall'], ep_idx)
+        self.writer.add_scalar('Info/iso/reserve_cost', iso['reserve_cost'], ep_idx)
+        self.writer.add_scalar('Info/iso/dispatch_cost', iso['dispatch_cost'], ep_idx)
+        # Dynamic ISO actions mean
+        acts = np.array(iso['actions'])
+        for comp in range(self.act_dim):
+            self.writer.add_scalar(
+                f'Info/iso/actions_mean_comp{comp}',
+                acts[:, comp].mean(),
+                ep_idx
+            )
+
+        # Hardcoded PCS fields
+        pcs = info['pcs']
+        self.writer.add_scalar('Info/pcs/battery_levels', np.mean(pcs['battery_levels']), ep_idx)
+        self.writer.add_scalar('Info/pcs/energy_exchanges', np.mean(pcs['energy_exchanges']), ep_idx)
+        self.writer.add_scalar('Info/pcs/costs', np.mean(pcs['costs']), ep_idx)
+        self.writer.add_scalar('Info/pcs/shortfall', pcs['shortfall'], ep_idx)
+        # Dynamic PCS actions mean
+        pcs_acts = np.array(pcs['actions'])
+        for comp in range(self.act_dim):
+            self.writer.add_scalar(
+                f'Info/pcs/actions_mean_comp{comp}',
+                pcs_acts[:, comp].mean(),
+                ep_idx
+            )
 
     def train(self, num_episodes):
         step = 0
@@ -155,10 +195,29 @@ class MOSAC:
             for _ in range(self.max_steps):
                 action = self.select_action(obs)
                 next_obs, reward, terminated, truncated, info = self.env.step(action)
+                last_info = info
                 self.buffer.add((obs, action, reward, next_obs, terminated or truncated))
                 episode_rewards += reward
+
+                # Per-step raw action logging
+                if self.verbose:
+                    iso_act = np.array(info['iso']['actions'])
+                    for comp in range(self.act_dim):
+                        self.writer.add_scalar(
+                            f'Raw/iso/action_comp{comp}',
+                            iso_act[comp],
+                            self.global_step
+                        )
+                    pcs_act = np.array(info['pcs']['actions'])
+                    for comp in range(self.act_dim):
+                        self.writer.add_scalar(
+                            f'Raw/pcs/action_comp{comp}',
+                            pcs_act[comp],
+                            self.global_step
+                        )
+                    self.global_step += 1
+
                 obs = next_obs
-                last_info = info
 
                 if len(self.buffer.buffer) > self.batch_size:
                     self.update(step)
@@ -167,13 +226,11 @@ class MOSAC:
                 if terminated or truncated:
                     break
 
+            # Episode-level logging
             for idx, r in enumerate(episode_rewards):
                 self.writer.add_scalar(f'Reward/Objective_{idx}', r, ep)
-            
-            # Optional verbose info logging
             if self.verbose and last_info is not None:
                 self._log_info(last_info, ep)
-
 
     def evaluate(self, episodes=10):
         rewards = []
@@ -188,5 +245,4 @@ class MOSAC:
                     break
             rewards.append(ep_reward)
 
-        avg_rewards = np.mean(rewards, axis=0)
-        return avg_rewards
+        return np.mean(rewards, axis=0)
