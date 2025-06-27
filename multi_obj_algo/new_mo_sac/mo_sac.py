@@ -214,6 +214,7 @@ class MOSAC:
                                 f'Raw/pcs/action_comp{comp}', val, self.global_step
                             )
                     self.global_step += 1
+                    self.writer.add_scalar(f"global_step", self.global_step, self.global_step)
 
                 obs = next_obs
 
